@@ -6,297 +6,261 @@ from pptx.enum.text import PP_ALIGN
 import io
 import re
 import zipfile
-from PIL import Image
 
-# --- 页面基础配置 ---
-st.set_page_config(page_title="论文图表高清提取工具", page_icon="📑", layout="wide")
+# --- 页面配置 ---
+st.set_page_config(page_title="论文图表智能重构工具", page_icon="🧩", layout="wide")
 
-# --- 核心逻辑函数 ---
+# --- 核心工具函数 ---
 
 def sanitize_filename(text):
-    """清理文件名，去除非法字符，保留图名关键信息"""
-    # 去除换行符
-    text = text.replace('\n', ' ').replace('\r', '')
-    # 只保留中文、字母、数字、部分符号
+    """清洗文件名"""
+    text = re.sub(r'\s+', ' ', text)  # 合并空格
     text = re.sub(r'[\\/*?:"<>|]', "", text)
-    # 限制长度防止文件名过长
-    return text.strip()[:80]
+    return text.strip()[:60]
 
 def is_caption(text):
-    """
-    判断文本块是否是图注。
-    针对中文期刊优化：匹配 '图 1'、'图1'、'Fig. 1'、'Figure 1'
-    """
-    # 移除首尾空白
-    text = text.strip()
-    # 正则：以 "图" 或 "Fig" 开头，后跟数字
-    # 允许 "图" 和数字之间有空格
-    pattern = r'^(图|Fig(ure)?\.?)\s*\d+'
+    """精准识别图注，支持中文和英文"""
+    # 匹配: "图1", "图 1", "Fig.1", "Figure 1", "Fig 1"
+    # 忽略大小写
+    pattern = r'^\s*(图|Fig(ure)?\.?)\s*\d+'
     return re.match(pattern, text, re.IGNORECASE) is not None
 
-def get_smart_clip_rect(page, caption_rect, page_width, page_height):
+def get_smart_bbox(page, caption_rect, text_blocks):
     """
-    智能计算截图区域 (核心算法)
-    针对双栏排版优化。
+    【重构核心】不再盲目截图，而是基于对象（Object-Based）计算包围盒。
+    
+    逻辑：
+    1. 找到图注 (Bottom Limit)。
+    2. 找到图注正上方最近的一段文字 (Top Limit)。
+    3. 获取该区域内所有的 图片(Images) 和 绘图(Drawings)。
+    4. 计算这些对象的并集矩形 (Union Rect)。
     """
-    x0, y0, x1, y1 = caption_rect
-    caption_center_x = (x0 + x1) / 2
     
-    # --- 1. 判断版式 (左栏、右栏、通栏) ---
-    # 假设页面分为三部分：左(0-40%)，中(40-60%)，右(60-100%)
-    # 实际上双栏的中轴线大约在 page_width / 2
+    # 1. 确定搜索区域的 左右边界 (处理双栏)
+    page_w = page.rect.width
+    mid_x = page_w / 2
     
-    layout_type = "UNKNOWN"
+    # 判断图注在左栏、右栏还是跨栏
+    if caption_rect.x1 < mid_x + 20: # 左栏
+        search_x0, search_x1 = 0, mid_x + 20
+    elif caption_rect.x0 > mid_x - 20: # 右栏
+        search_x0, search_x1 = mid_x - 20, page_w
+    else: # 通栏
+        search_x0, search_x1 = 0, page_w
+        
+    # 2. 确定搜索区域的 上下边界
+    # 下界：图注的顶部
+    y_bottom = caption_rect.y0 
     
-    # 判定阈值
-    left_boundary = page_width * 0.45
-    right_boundary = page_width * 0.55
+    # 上界：寻找正上方最近的一个文本块
+    # 默认上界为页眉位置 (假设50)
+    y_top = 50 
     
-    if x1 < left_boundary:
-        layout_type = "LEFT_COLUMN"
-        search_x0, search_x1 = 0, page_width / 2
-    elif x0 > right_boundary:
-        layout_type = "RIGHT_COLUMN"
-        search_x0, search_x1 = page_width / 2, page_width
-    else:
-        # 如果图注横跨了中轴线，或者位于中间，通常是通栏大图
-        layout_type = "FULL_WIDTH"
-        search_x0, search_x1 = 0, page_width
+    # 在所有文本块中，找到位于图注上方、且在同栏内的最近文本
+    closest_gap = float('inf')
+    
+    for b in text_blocks:
+        b_rect = fitz.Rect(b[:4])
+        # 排除当前的图注本身
+        if abs(b_rect.y0 - caption_rect.y0) < 5:
+            continue
+            
+        # 必须在图注上方
+        if b_rect.y1 < y_bottom:
+            # 必须在同栏 (水平方向有交集)
+            if not (b_rect.x1 < search_x0 or b_rect.x0 > search_x1):
+                gap = y_bottom - b_rect.y1
+                if gap < closest_gap:
+                    closest_gap = gap
+                    y_top = b_rect.y1 # 更新上界为这段文字的底部
 
-    # --- 2. 向上寻找视觉元素 (Images & Drawings) ---
-    # 获取页面上所有的绘图指令(矢量线条)和图片
+    # 稍微放宽一点上界，防止紧贴
+    y_top = max(50, y_top + 2) 
+
+    # 定义“感兴趣区域” (ROI)
+    roi_rect = fitz.Rect(search_x0, y_top, search_x1, y_bottom)
+
+    # 3. 获取所有视觉对象 (Images & Drawings)
+    # PyMuPDF 的 get_drawings 获取所有矢量路径
     drawings = page.get_drawings()
+    # get_images 获取位图
     images = page.get_images(full=True)
     
-    # 收集所有位于图注上方、且在当前栏宽度范围内的视觉元素包围盒
-    candidates = []
+    # 容器：存放所有属于该图的对象矩形
+    target_rects = []
     
-    # 设定搜索的顶部极限 (防止截到上一页的内容或者页眉)
-    # 假设图表不会超过大半页，且至少在页眉(50pt)之下
-    min_y_limit = 50 
-    
-    # 检查矢量绘图 (线条、背景色块等)
+    # 筛选矢量绘图
     for draw in drawings:
-        r = draw["rect"] # fitz.Rect
-        # 逻辑：
-        # 1. 元素底部必须在图注上方 (r.y1 <= y0 + 10) (+10是容错)
-        # 2. 元素顶部必须在页眉下方
-        # 3. 元素水平方向必须在当前栏范围内 (有一定交集)
-        if r.y1 <= y0 + 15 and r.y0 > min_y_limit:
-            # 检查水平重叠
-            if not (r.x1 < search_x0 or r.x0 > search_x1):
-                candidates.append(r)
-                
-    # 检查嵌入图片
+        r = draw["rect"]
+        # 如果这个矢量图在 ROI 内部，或者与 ROI 高度重叠
+        intersect = r & roi_rect # 计算交集
+        if intersect.get_area() > 0:
+            # 排除巨大的背景色块 (比如整个页面的背景)
+            if r.width > page_w * 0.9 and r.height > page.rect.height * 0.9:
+                continue
+            target_rects.append(r)
+            
+    # 筛选图片对象
     for img in images:
         try:
             img_rect = page.get_image_bbox(img)
-            if img_rect.y1 <= y0 + 15 and img_rect.y0 > min_y_limit:
-                 if not (img_rect.x1 < search_x0 or img_rect.x0 > search_x1):
-                    candidates.append(img_rect)
+            intersect = img_rect & roi_rect
+            if intersect.get_area() > 0:
+                target_rects.append(img_rect)
         except:
             pass
 
-    # --- 3. 计算最终裁剪框 ---
-    if not candidates:
-        # 如果没找到任何矢量或图片对象（可能是扫描件或者纯文本图），回退到几何估算
-        # 默认截取图注上方 1/3 页高度的区域
-        fallback_height = page_height / 3
-        final_top = max(min_y_limit, y0 - fallback_height)
+    # 4. 计算最终包围盒 (Merge)
+    if not target_rects:
+        # 如果真的啥也没抓到（极少见），回退到几何切割
+        return roi_rect
+    
+    # 计算所有矩形的并集
+    final_rect = target_rects[0]
+    for r in target_rects:
+        final_rect |= r # Union操作
         
-        # 宽度收缩一下，避免贴边
-        margin = 30
-        final_rect = fitz.Rect(search_x0 + margin, final_top, search_x1 - margin, y0)
-        return final_rect
+    # 5. 最终修正
+    # 确保宽度不会因为某个错误的线条变得无限宽，限制在栏宽内
+    final_rect.x0 = max(search_x0, final_rect.x0)
+    final_rect.x1 = min(search_x1, final_rect.x1)
     
-    # 合并所有候选框
-    final_rect = candidates[0]
-    for r in candidates:
-        final_rect |= r # 计算并集
-        
-    # --- 4. 边界微调 ---
-    # 底部：紧贴图注上方
-    final_rect.y1 = y0
+    # 确保底部不覆盖图注
+    final_rect.y1 = min(final_rect.y1, caption_rect.y0)
     
-    # 左右：如果是通栏，尽量居中；如果是分栏，确保不越界
-    # 可以在检测到的物体边缘再加一点点留白(padding)
-    padding = 5
-    final_rect.x0 = max(0, final_rect.x0 - padding)
-    final_rect.x1 = min(page_width, final_rect.x1 + padding)
-    final_rect.y0 = max(min_y_limit, final_rect.y0 - padding)
-    
-    # 宽度校验：如果检测到的区域太窄（比如只是一个标点），可能出错了，强制扩充到图注宽度
-    if final_rect.width < caption_rect.width:
-        center = (final_rect.x0 + final_rect.x1) / 2
-        half_w = caption_rect.width / 2
-        final_rect.x0 = min(final_rect.x0, center - half_w)
-        final_rect.x1 = max(final_rect.x1, center + half_w)
-
+    # 增加一点点内边距，为了美观
     return final_rect
 
-# --- 主程序 UI ---
-st.title("📑 论文智能图表提取 & PPT生成器 (Pro版)")
-st.markdown("专为双栏排版中文期刊设计。自动识别“图 X”，智能裁剪，生成高清PPT。")
 
-# 侧边栏设置
+# --- UI 主程序 ---
+st.title("🧩 论文图表智能重构 (Refactored)")
+st.caption("使用 对象聚类算法 (Object Clustering) 替代传统的截图扫描，精准提取矢量图与混合图表。")
+
 with st.sidebar:
-    st.header("⚙️ 导出设置")
-    ppt_ratio = st.radio("PPT 画板尺寸", ["16:9 (宽屏)", "3:4 (竖版/A4类似)", "4:3 (传统)"])
-    st.info("💡 说明：\n会自动使用 **300 DPI** 超高清渲染，确保文字清晰可见。")
+    st.header("设置")
+    ppt_orientation = st.radio("PPT版式", ["3:4 (竖版/阅读模式)", "16:9 (横版/演示模式)"])
+    dpi_scale = 4.0 # 强制高清
 
-uploaded_file = st.file_uploader("📂 上传 PDF 文件", type="pdf")
+uploaded_file = st.file_uploader("上传 PDF 论文", type="pdf")
 
-if uploaded_file:
-    # 按钮触发
-    if st.button("🚀 开始高清提取"):
-        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+if uploaded_file and st.button("🚀 开始重构与提取", type="primary"):
+    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    
+    # 初始化 PPT
+    prs = Presentation()
+    if ppt_orientation.startswith("3:4"):
+        prs.slide_width = Inches(8.27)  # A4 宽度
+        prs.slide_height = Inches(11.69) # A4 高度
+    else:
+        prs.slide_width = Inches(13.33)
+        prs.slide_height = Inches(7.5)
         
-        # 1. 初始化 PPT
-        prs = Presentation()
+    results = []
+    status = st.empty()
+    bar = st.progress(0)
+    
+    for page_idx, page in enumerate(doc):
+        status.text(f"正在解析结构: 第 {page_idx + 1} 页...")
+        bar.progress((page_idx + 1) / len(doc))
         
-        # 设置尺寸
-        if ppt_ratio == "16:9 (宽屏)":
-            prs.slide_width = Inches(13.333)
-            prs.slide_height = Inches(7.5)
-        elif ppt_ratio == "3:4 (竖版/A4类似)":
-            # 7.5英寸宽 x 10英寸高
-            prs.slide_width = Inches(7.5)
-            prs.slide_height = Inches(10)
-        else:
-            # 4:3
-            prs.slide_width = Inches(10)
-            prs.slide_height = Inches(7.5)
-
-        extracted_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        # 1. 获取所有文本块 (用于定位上下文)
+        text_blocks = page.get_text("blocks")
+        # 2. 找出所有图注
+        captions = []
+        for b in text_blocks:
+            text = b[4].replace('\n', ' ').strip()
+            if is_caption(text):
+                captions.append({
+                    "rect": fitz.Rect(b[:4]),
+                    "text": text
+                })
         
-        total_pages = len(doc)
-        
-        for page_idx, page in enumerate(doc):
-            status_text.text(f"正在扫描第 {page_idx + 1}/{total_pages} 页...")
-            progress_bar.progress((page_idx + 1) / total_pages)
+        if not captions:
+            continue
             
-            # 获取文本块
-            blocks = page.get_text("blocks")
-            # 排序：从上到下，从左到右
-            blocks.sort(key=lambda b: (b[1], b[0]))
+        # 3. 针对每个图注，智能计算其对应的图形区域
+        for cap in captions:
+            # 核心重构方法调用
+            figure_rect = get_smart_bbox(page, cap["rect"], text_blocks)
             
-            for block in blocks:
-                # block: (x0, y0, x1, y1, text, ...)
-                text = block[4]
+            # 过滤无效区域
+            if figure_rect.width < 10 or figure_rect.height < 10:
+                continue
                 
-                if is_caption(text):
-                    # 找到图注
-                    caption_rect = fitz.Rect(block[:4])
-                    clean_caption = text.strip().replace("\n", " ")
-                    
-                    # 智能计算图片区域
-                    clip_rect = get_smart_clip_rect(page, caption_rect, page.rect.width, page.rect.height)
-                    
-                    # 过滤无效小区域
-                    if clip_rect.width < 50 or clip_rect.height < 50:
-                        continue
-                        
-                    # --- 高清截图 (Snapshot) ---
-                    # matrix=4 表示 4倍分辨率 (约300 DPI)，保证极高清晰度
-                    zoom = 4 
-                    mat = fitz.Matrix(zoom, zoom)
-                    pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
-                    img_bytes = pix.tobytes("png")
-                    
-                    # 文件名处理
-                    file_name_clean = sanitize_filename(clean_caption)
-                    if not file_name_clean:
-                        file_name_clean = f"Page_{page_idx+1}_Figure"
-                        
-                    extracted_results.append({
-                        "bytes": img_bytes,
-                        "name": file_name_clean,
-                        "page": page_idx + 1
-                    })
-                    
-                    # --- 写入 PPT ---
-                    # 使用空白版式
-                    slide = prs.slides.add_slide(prs.slide_layouts[6])
-                    
-                    ppt_w = prs.slide_width
-                    ppt_h = prs.slide_height
-                    
-                    # 1. 放置图片
-                    # 计算图片缩放比例 (Contain)
-                    margin = Inches(0.5) # 边距
-                    max_w = ppt_w - 2 * margin
-                    max_h = ppt_h - 2 * Inches(1.0) # 底部留多一点给文字
-                    
-                    img_w_px = pix.width
-                    img_h_px = pix.height
-                    aspect = img_w_px / img_h_px
-                    
-                    target_w = max_w
-                    target_h = target_w / aspect
-                    
-                    if target_h > max_h:
-                        target_h = max_h
-                        target_w = target_h * aspect
-                        
-                    left = (ppt_w - target_w) / 2
-                    top = (ppt_h - target_h) / 2 - Inches(0.3) # 稍微往上提一点
-                    
-                    image_stream = io.BytesIO(img_bytes)
-                    slide.shapes.add_picture(image_stream, left, top, width=target_w, height=target_h)
-                    
-                    # 2. 放置图注 (标题)
-                    textbox_height = Inches(1.0)
-                    txBox = slide.shapes.add_textbox(margin, top + target_h + Inches(0.1), max_w, textbox_height)
-                    tf = txBox.text_frame
-                    tf.word_wrap = True # 自动换行
-                    p = tf.add_paragraph()
-                    p.text = clean_caption
-                    p.font.size = Pt(16) # 字号
-                    p.font.bold = True
-                    p.font.name = 'Microsoft YaHei' # 尝试设置微软雅黑
-                    p.alignment = PP_ALIGN.CENTER
+            # 4. 高清渲染该区域
+            # fitz.Matrix(4, 4) = 300 DPI
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi_scale, dpi_scale), clip=figure_rect, alpha=False)
+            img_bytes = pix.tobytes("png")
+            
+            # 结果存入列表
+            results.append({
+                "bytes": img_bytes,
+                "name": sanitize_filename(cap["text"]),
+                "page": page_idx + 1,
+                "w": pix.width,
+                "h": pix.height
+            })
+            
+            # --- 5. 写入 PPT ---
+            slide = prs.slides.add_slide(prs.slide_layouts[6]) # 空白页
+            
+            ppt_w = prs.slide_width
+            ppt_h = prs.slide_height
+            margin = Inches(0.5)
+            
+            # 布局计算
+            avail_w = ppt_w - 2 * margin
+            avail_h = ppt_h - 2 * Inches(1.0) # 留出文本空间
+            
+            img_ratio = pix.width / pix.height
+            
+            # 适应逻辑 (Contain)
+            final_w = avail_w
+            final_h = final_w / img_ratio
+            
+            if final_h > avail_h:
+                final_h = avail_h
+                final_w = final_h * img_ratio
+            
+            left = (ppt_w - final_w) / 2
+            top = (avail_h - final_h) / 2 + Inches(0.2)
+            
+            # 插入图片
+            slide.shapes.add_picture(io.BytesIO(img_bytes), left, top, width=final_w, height=final_h)
+            
+            # 插入图名 (底部居中)
+            txbox = slide.shapes.add_textbox(margin, top + final_h + Inches(0.1), avail_w, Inches(1))
+            tf = txbox.text_frame
+            p = tf.add_paragraph()
+            p.text = cap["text"]
+            p.alignment = PP_ALIGN.CENTER
+            p.font.size = Pt(14)
+            p.font.bold = True
+            
+    status.text("✅ 重构完成！")
+    
+    if results:
+        col1, col2 = st.columns(2)
         
-        status_text.text("✅ 处理完成！")
+        # PPT 下载
+        out_ppt = io.BytesIO()
+        prs.save(out_ppt)
+        out_ppt.seek(0)
+        col1.download_button("📥 下载 PPT", out_ppt, "smart_layout.pptx")
         
-        if not extracted_results:
-            st.error("未找到以'图'或'Figure'开头的图注。请检查PDF是否包含可搜索文本。")
-        else:
-            st.success(f"成功提取 {len(extracted_results)} 张高清图表！")
-            
-            # --- 下载区域 ---
-            c1, c2 = st.columns(2)
-            
-            # 1. 下载 PPT
-            out_ppt = io.BytesIO()
-            prs.save(out_ppt)
-            out_ppt.seek(0)
-            c1.download_button(
-                label=f"📥 下载 PPT ({ppt_ratio})",
-                data=out_ppt,
-                file_name="paper_figures.pptx",
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                type="primary"
-            )
-            
-            # 2. 下载图片包
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for idx, item in enumerate(extracted_results):
-                    # 文件名格式: P1_图1_xxx.png
-                    fname = f"P{item['page']}_{item['name']}.png"
-                    zf.writestr(fname, item['bytes'])
-            zip_buffer.seek(0)
-            
-            c2.download_button(
-                label="📦 下载高清图片包 (ZIP)",
-                data=zip_buffer,
-                file_name="figures_hd.zip",
-                mime="application/zip"
-            )
-            
-            st.divider()
-            st.subheader("🖼️ 提取结果预览")
-            for item in extracted_results:
-                st.image(item['bytes'], caption=f"P{item['page']} | {item['name']}")
+        # ZIP 下载
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in results:
+                fname = f"P{item['page']}_{item['name']}.png"
+                zf.writestr(fname, item['bytes'])
+        zip_buf.seek(0)
+        col2.download_button("📦 下载图片包 (ZIP)", zip_buf, "smart_images.zip")
+        
+        # 预览
+        st.divider()
+        st.subheader(f"成功提取 {len(results)} 个图表结构")
+        for res in results:
+            st.image(res["bytes"], caption=f"Page {res['page']}: {res['name']}")
+    else:
+        st.warning("未检测到图表。请确认PDF包含 '图 X' 或 'Figure X' 格式的图注。")
