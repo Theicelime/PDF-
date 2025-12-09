@@ -5,34 +5,30 @@ import io
 import re
 import zipfile
 import base64
+import fitz  # PyMuPDF
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
 from streamlit_drawable_canvas import st_canvas
 
 # ==========================================
-# 🔥 紧急修复补丁 (Monkey Patch) 🔥
-# 修复 Streamlit 新版本导致 st_canvas 报错的问题
+# 1. 紧急修复补丁 (防止报错)
 # ==========================================
 if not hasattr(st_image, 'image_to_url'):
     def local_image_to_url(image, width, clamp, channels, output_format, image_id):
-        """将 PIL 图片转为 Base64 DataURL，模拟旧版 Streamlit 行为"""
         buffered = io.BytesIO()
-        # 强制转为 RGB 防止 RGBA 在 JPEG 下报错
         if output_format.upper() == "JPEG" and image.mode == "RGBA":
             image = image.convert("RGB")
         image.save(buffered, format=output_format)
         img_str = base64.b64encode(buffered.getvalue()).decode()
         return (f"data:image/{output_format.lower()};base64,{img_str}",)
-    
-    # 强行把这个函数塞回 Streamlit 里
     st_image.image_to_url = local_image_to_url
+
 # ==========================================
+# 2. 核心功能函数
+# ==========================================
+st.set_page_config(page_title="PDF 瀑布流提取工具", layout="wide", page_icon="📜")
 
-# --- 页面配置 ---
-st.set_page_config(page_title="PDF 图表手动提取工具 (修复版)", layout="wide", page_icon="✂️")
-
-# --- 核心函数 ---
 def sanitize_filename(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return re.sub(r'[\\/*?:"<>|]', "_", text)[:50]
@@ -46,7 +42,29 @@ def trim_white_borders(pil_image):
         return pil_image.crop(bbox)
     return pil_image
 
-def process_selection(page, rect_pdf, dpi_scale=8.33):
+@st.cache_data
+def get_page_image(file_content, page_num, zoom=2.0):
+    """缓存页面渲染，防止滚动时卡顿"""
+    doc = fitz.open(stream=file_content, filetype="pdf")
+    page = doc[page_num]
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return img
+
+def process_extraction(file_content, page_num, rect_dict, dpi_scale=8.33):
+    """处理提取：OCR识别 -> 涂白 -> 裁剪"""
+    doc = fitz.open(stream=file_content, filetype="pdf")
+    page = doc[page_num]
+    
+    # 还原坐标 (Canvas 2倍缩放 -> PDF 坐标)
+    scale = 0.5 # 因为显示是用2倍缩放的
+    r_x = rect_dict["left"] * scale
+    r_y = rect_dict["top"] * scale
+    r_w = rect_dict["width"] * scale
+    r_h = rect_dict["height"] * scale
+    rect_pdf = fitz.Rect(r_x, r_y, r_x + r_w, r_y + r_h)
+    
     # 1. 提取文字
     text_dict = page.get_text("dict", clip=rect_pdf)
     extracted_text_parts = []
@@ -62,9 +80,9 @@ def process_selection(page, rect_pdf, dpi_scale=8.33):
     
     full_caption = " ".join(extracted_text_parts)
     if not full_caption:
-        full_caption = "未命名图表"
+        full_caption = f"Page_{page_num+1}_Image"
         
-    # 2. 高清截图 (600 DPI)
+    # 2. 高清截图
     mat = fitz.Matrix(dpi_scale, dpi_scale)
     pix = page.get_pixmap(matrix=mat, clip=rect_pdf, alpha=False)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -89,93 +107,158 @@ def process_selection(page, rect_pdf, dpi_scale=8.33):
     
     return out_io.getvalue(), full_caption, final_img.width, final_img.height
 
-import fitz # PyMuPDF
+# ==========================================
+# 3. 界面逻辑
+# ==========================================
 
-# --- UI 逻辑 ---
+# 状态初始化
 if 'extracted_list' not in st.session_state:
     st.session_state.extracted_list = []
 
+# --- 侧边栏 ---
 with st.sidebar:
-    st.header("1. 上传文件")
-    uploaded_file = st.file_uploader("PDF 文件", type="pdf")
+    st.header("1. 导入 PDF")
+    uploaded_file = st.file_uploader("文件上传", type="pdf")
     
-    st.header("3. 导出设置")
-    ppt_ratio = st.radio("PPT 比例", ["3:4 (竖版)", "16:9 (横版)"], index=0)
+    # 如果文件太大，允许用户限制显示的页数，避免卡顿
+    display_range = None
+    if uploaded_file:
+        doc_temp = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+        total_pages = len(doc_temp)
+        if total_pages > 5:
+            st.info(f"文档共 {total_pages} 页")
+            display_range = st.slider("显示页码范围 (防止卡顿)", 1, total_pages, (1, min(10, total_pages)))
     
     st.divider()
-    st.write(f"已提取: **{len(st.session_state.extracted_list)}** 张")
-    if st.button("🗑️ 清空列表"):
+    st.header("3. 导出结果")
+    st.write(f"已提取图片: **{len(st.session_state.extracted_list)}** 张")
+    
+    # 预览小图
+    if st.session_state.extracted_list:
+        with st.expander("查看已提取列表"):
+            for idx, item in enumerate(st.session_state.extracted_list):
+                col_del, col_txt = st.columns([1, 4])
+                with col_txt:
+                    st.caption(f"{idx+1}. {item['name']}")
+    
+    if st.button("🗑️ 清空所有"):
         st.session_state.extracted_list = []
         st.rerun()
 
-st.title("✂️ 框选提取工具 (已修复错误)")
-st.caption("步骤：上传 PDF → 选择页码 → **框选包含图和文字的区域** → 点击提取。")
-
-if uploaded_file:
-    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    
-    col_sel, col_info = st.columns([1, 3])
-    with col_sel:
-        page_num = st.number_input("当前页码", min_value=1, max_value=len(doc), value=1)
-    
-    # 准备页面图像
-    page = doc[page_num - 1]
-    
-    # 2倍缩放显示
-    display_zoom = 2.0
-    disp_pix = page.get_pixmap(matrix=fitz.Matrix(display_zoom, display_zoom))
-    bg_img = Image.open(io.BytesIO(disp_pix.tobytes("png")))
-    
-    st.write("👇 **在下方画框 (包含图和文字)**")
-    
-    # 画布
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 0, 0, 0.1)",
-        stroke_width=2,
-        stroke_color="#FF0000",
-        background_image=bg_img, # 这里之前报错，现在补丁已修复
-        update_streamlit=True,
-        height=bg_img.height,
-        width=bg_img.width,
-        drawing_mode="rect",
-        key=f"canvas_p{page_num}",
-        display_toolbar=True,
-    )
-    
-    if canvas_result.json_data is not None:
-        objects = canvas_result.json_data["objects"]
-        if objects:
-            last_obj = objects[-1]
-            if st.button("⚡ 提取选中区域", type="primary"):
-                scale = 1 / display_zoom
-                r_x = last_obj["left"] * scale
-                r_y = last_obj["top"] * scale
-                r_w = last_obj["width"] * scale
-                r_h = last_obj["height"] * scale
-                
-                rect_pdf = fitz.Rect(r_x, r_y, r_x + r_w, r_y + r_h)
-                
-                try:
-                    img_bytes, img_name, w, h = process_selection(page, rect_pdf)
-                    
-                    st.session_state.extracted_list.append({
-                        "bytes": img_bytes,
-                        "name": sanitize_filename(img_name),
-                        "page": page_num,
-                        "w": w, "h": h
-                    })
-                    st.success(f"提取成功: {img_name}")
-                except Exception as e:
-                    st.error(f"提取出错: {e}")
-
-    # --- 导出 ---
+    # 导出按钮
     if st.session_state.extracted_list:
-        st.divider()
-        st.subheader("📥 导出")
-        
         c1, c2 = st.columns(2)
         
-        # PPT
+        # PPTX
         prs = Presentation()
-        if ppt_ratio.startswith("3:4"):
-            pr
+        # 默认 3:4
+        prs.slide_width = Inches(7.5); prs.slide_height = Inches(10)
+        
+        for item in st.session_state.extracted_list:
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            pw, ph = prs.slide_width, prs.slide_height
+            margin = Inches(0.5)
+            
+            img_io = io.BytesIO(item["bytes"])
+            
+            # 布局计算
+            max_h = ph - Inches(1.5)
+            max_w = pw - margin * 2
+            ratio = item["w"] / item["h"]
+            target_w = max_w
+            target_h = target_w / ratio
+            if target_h > max_h:
+                target_h = max_h
+                target_w = target_h * ratio
+            
+            left = (pw - target_w) / 2
+            top = Inches(0.5)
+            
+            slide.shapes.add_picture(img_io, left, top, width=target_w, height=target_h)
+            
+            tb = slide.shapes.add_textbox(margin, top + target_h + Inches(0.1), pw - margin*2, Inches(1))
+            p = tb.text_frame.add_paragraph()
+            p.text = item["name"]
+            p.alignment = PP_ALIGN.CENTER
+            p.font.bold = True
+            p.font.size = Pt(14)
+            p.font.name = "Microsoft YaHei"
+            
+        ppt_io = io.BytesIO()
+        prs.save(ppt_io); ppt_io.seek(0)
+        c1.download_button("📥 PPTX", ppt_io, "export.pptx")
+        
+        # ZIP
+        zip_io = io.BytesIO()
+        with zipfile.ZipFile(zip_io, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, item in enumerate(st.session_state.extracted_list):
+                zf.writestr(f"{i+1}_{item['name']}.png", item["bytes"])
+        zip_io.seek(0)
+        c2.download_button("📦 ZIP", zip_io, "images.zip")
+
+# --- 主界面：瀑布流显示 ---
+st.title("📜 浏览模式提取工具")
+st.info("操作方式：像看书一样往下滑，看到想提取的图，直接**画框**，然后点下方的**⚡提取**按钮。")
+
+if uploaded_file:
+    # 读取文件流
+    bytes_data = uploaded_file.getvalue()
+    
+    # 确定显示范围
+    start_p = 0
+    end_p = total_pages
+    if display_range:
+        start_p = display_range[0] - 1
+        end_p = display_range[1]
+    
+    # === 循环渲染每一页 ===
+    for p_idx in range(start_p, end_p):
+        st.divider()
+        st.markdown(f"### 第 {p_idx + 1} 页")
+        
+        # 1. 获取背景图 (带缓存，速度快)
+        bg_image = get_page_image(bytes_data, p_idx)
+        
+        # 2. 创建画布
+        # key 必须唯一，使用页码区分
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.1)",
+            stroke_width=2,
+            stroke_color="#FF0000",
+            background_image=bg_image,
+            update_streamlit=True,
+            height=bg_image.height,
+            width=bg_image.width,
+            drawing_mode="rect",
+            key=f"canvas_page_{p_idx}", # 关键：每页独立的 ID
+            display_toolbar=True,
+        )
+        
+        # 3. 提取按钮 (跟随在每一页下面)
+        # 检查当前页是否有新画的框
+        if canvas_result.json_data and canvas_result.json_data["objects"]:
+            last_obj = canvas_result.json_data["objects"][-1]
+            
+            col_btn, col_msg = st.columns([1, 4])
+            with col_btn:
+                # 按钮 key 也必须唯一
+                if st.button(f"⚡ 提取第 {p_idx+1} 页选中区域", key=f"btn_{p_idx}", type="primary"):
+                    try:
+                        img_bytes, img_name, w, h = process_extraction(bytes_data, p_idx, last_obj)
+                        
+                        st.session_state.extracted_list.append({
+                            "bytes": img_bytes,
+                            "name": sanitize_filename(img_name),
+                            "page": p_idx + 1,
+                            "w": w, "h": h
+                        })
+                        st.success(f"已提取: {img_name}")
+                        # 强制刷新侧边栏
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"提取出错: {e}")
+            with col_msg:
+                st.caption("✅ 已选中区域，点击左侧按钮提取")
+
+else:
+    st.warning("请在左侧上传 PDF 文件。")
