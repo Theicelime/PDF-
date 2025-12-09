@@ -1,5 +1,6 @@
-streamlit
+streamlit==1.38.0
 pymupdf
 python-pptx
 Pillow
-streamlit-drawable-canvas
+streamlit-drawable-canvas==0.9.3
+numpy<2
