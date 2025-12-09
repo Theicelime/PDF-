@@ -8,192 +8,212 @@ import re
 import zipfile
 from PIL import Image, ImageChops
 
-# --- 页面设置 ---
-st.set_page_config(page_title="论文图表暴力提取器", page_icon="⛏️", layout="wide")
+# --- 基础设置 ---
+st.set_page_config(page_title="PDF 图表暴力提取 (最终修正版)", layout="wide", page_icon="🔨")
 
 def sanitize_filename(text):
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'[\\/*?:"<>|]', "", text)
-    return text[:50]
+    return re.sub(r'[\\/*?:"<>|\s]', "_", text)[:50]
 
-def trim(im):
+def trim_white_borders(pil_image):
     """
-    自动裁剪图片四周的白边（基于像素差异）。
-    如果图片是全白的，返回 None。
+    自动切除图片四周的白边。
     """
-    bg = Image.new(im.mode, im.size, im.getpixel((0,0)))
-    diff = ImageChops.difference(im, bg)
+    bg = Image.new(pil_image.mode, pil_image.size, pil_image.getpixel((0,0)))
+    diff = ImageChops.difference(pil_image, bg)
     diff = ImageChops.add(diff, diff, 2.0, -100)
     bbox = diff.getbbox()
     if bbox:
-        return im.crop(bbox)
-    return None
+        return pil_image.crop(bbox)
+    return pil_image # 全白或切不了，返回原图
 
 def is_caption(text):
-    # 匹配 "图 6", "图6", "Fig.6", "Figure 6"
+    # 匹配中文和英文图注
     return re.match(r'^\s*(图|Fig(ure)?\.?)\s*\d+', text, re.IGNORECASE) is not None
 
-def get_gap_crop(page, caption_block, all_blocks, page_width):
-    """
-    【核心逻辑：缝隙切片法】
-    不找图，只找图注和上一段正文之间的缝隙。
-    """
-    c_x0, c_y0, c_x1, c_y1 = caption_block[:4]
-    
-    # 1. 强行判定栏位（以页面中线为界）
-    mid_x = page_width / 2
-    # 如果图注在左边
-    if c_x1 < mid_x + 10: 
-        col_x0, col_x1 = 0, mid_x
-    # 如果图注在右边
-    elif c_x0 > mid_x - 10:
-        col_x0, col_x1 = mid_x, page_width
-    # 否则是通栏
-    else:
-        col_x0, col_x1 = 0, page_width
+def get_column_range(x_mid, page_width):
+    """根据图注的中心位置，返回它所在的栏位左右边界"""
+    mid_page = page_width / 2
+    if x_mid < mid_page: # 左栏
+        return 0, mid_page
+    else: # 右栏
+        return mid_page, page_width
 
-    # 2. 寻找天花板（正上方最近的文字）
-    # 默认天花板是页眉处 (70)
-    top_limit = 70 
+def extract_figures_strictly(doc, dpi_scale=4.0):
+    extracted_data = []
     
-    # 遍历所有文本块，找到在这个栏位里，且在图注上方的块
-    for b in all_blocks:
-        b_x0, b_y0, b_x1, b_y1 = b[:4]
+    for page_idx, page in enumerate(doc):
+        # 1. 获取所有文本块，关键：sort=True 保证按人类阅读顺序（从上到下，从左到右）
+        blocks = page.get_text("blocks", sort=True)
+        page_w = page.rect.width
         
-        # 排除自己
-        if abs(b_y0 - c_y0) < 5: continue
+        # 找出本页所有图注
+        captions = []
+        for i, b in enumerate(blocks):
+            text = b[4].strip().replace('\n', ' ')
+            if is_caption(text):
+                captions.append((i, b, text)) # 保存索引，方便找上一个块
         
-        # 必须在图注上方
-        if b_y1 < c_y0:
-            # 必须在同一栏（水平有重叠）
-            if not (b_x1 < col_x0 or b_x0 > col_x1):
-                # 更新最高点：取最大的 y1（最靠下的那个文本块的底部）
-                if b_y1 > top_limit:
-                    top_limit = b_y1
-    
-    # 3. 生成切片区域
-    # 宽度：直接占满整个分栏（靠后期去白边来修正）
-    # 高度：从上一段文字的底部，到图注的顶部
-    return fitz.Rect(col_x0, top_limit, col_x1, c_y0)
+        for i, (block_idx, cap_block, cap_text) in enumerate(captions):
+            # cap_block: (x0, y0, x1, y1, text, block_no, block_type)
+            c_x0, c_y0, c_x1, c_y1 = cap_block[:4]
+            cap_center_x = (c_x0 + c_x1) / 2
+            
+            # --- A. 确定左右边界 (分栏) ---
+            # 如果图注宽度超过页面的 60%，认为是通栏图，否则按左右分栏处理
+            if (c_x1 - c_x0) > page_w * 0.6:
+                col_x0, col_x1 = 0, page_w # 通栏
+            else:
+                col_x0, col_x1 = get_column_range(cap_center_x, page_w)
+            
+            # --- B. 确定上边界 (天花板) ---
+            # 默认天花板是页眉 (假设 50pt)
+            top_limit = 50.0 
+            
+            # 倒序遍历在当前图注之前的文本块，寻找最近的一个在同一栏的文字
+            # blocks 已经是排好序的，所以我们从当前图注的 index 往前找
+            for prev_idx in range(block_idx - 1, -1, -1):
+                p_b = blocks[prev_idx]
+                p_x0, p_y0, p_x1, p_y1 = p_b[:4]
+                
+                # 检查是否在同一栏 (水平方向有重叠)
+                # 逻辑：文本块中心点是否在栏位范围内
+                p_center_x = (p_x0 + p_x1) / 2
+                if col_x0 <= p_center_x <= col_x1:
+                    # 找到了正上方的文字！这就是天花板
+                    top_limit = p_y1 # 文字的底部作为图片的顶部
+                    break # 找到最近的一个就停止，不要再往上找了
+            
+            # --- C. 截图 ---
+            # 定义截图区域：[栏左, 天花板, 栏右, 图注顶]
+            # 加上一点 padding 防止切坏
+            clip_rect = fitz.Rect(col_x0, top_limit, col_x1, c_y0)
+            
+            # 有效性检查：如果高度是负的或者太小，说明出错了
+            if clip_rect.height < 10:
+                continue
+                
+            # 高清渲染
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi_scale, dpi_scale), clip=clip_rect, alpha=False)
+            
+            # --- D. 去白边 (关键) ---
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                img_trimmed = trim_white_borders(img)
+            except:
+                img_trimmed = img
+            
+            # 如果切完没东西了，跳过
+            if img_trimmed.width < 10 or img_trimmed.height < 10:
+                continue
+            
+            # 转回 bytes
+            out_buffer = io.BytesIO()
+            img_trimmed.save(out_buffer, format="PNG")
+            
+            extracted_data.append({
+                "image_bytes": out_buffer.getvalue(),
+                "name": sanitize_filename(cap_text),
+                "caption": cap_text,
+                "page": page_idx + 1,
+                "width": img_trimmed.width, # 像素宽
+                "height": img_trimmed.height # 像素高
+            })
+            
+    return extracted_data
 
 # --- 主界面 ---
-st.title("⛏️ 论文图表提取 (缝隙切片版)")
-st.markdown("原理：定位图注 -> 找到上一段文字 -> **暴力切取中间所有内容** -> 自动修剪白边。")
+st.title("🔨 论文图表提取工具 (强力阻断模式)")
+st.markdown("如果不准，那是我的错。此模式使用物理阻断法：**图注**与**上一段文字**之间的所有像素，一律切下来。")
 
 with st.sidebar:
-    ppt_ratio = st.radio("PPT 尺寸", ["3:4 (竖版 A4)", "16:9 (宽屏)"])
-    dpi = st.number_input("清晰度 (DPI倍率)", value=4.0, min_value=2.0, max_value=6.0)
+    st.header("生成设置")
+    # 按照你的要求，3:4 竖版
+    ppt_ver = st.radio("PPT 版式", ["3:4 (竖版 A4)", "16:9 (宽屏)"])
+    dpi_val = 4.0 # 默认高清
 
-uploaded_file = st.file_uploader("上传 PDF", type="pdf")
+uploaded_file = st.file_uploader("请上传PDF文件", type="pdf")
 
-if uploaded_file and st.button("开始提取"):
+if uploaded_file and st.button("开始处理", type="primary"):
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     
-    # PPT 初始化
-    prs = Presentation()
-    if ppt_ratio.startswith("3:4"):
-        prs.slide_width = Inches(8.27); prs.slide_height = Inches(11.69)
+    # 1. 执行提取
+    with st.spinner("正在逐页扫描缝隙..."):
+        results = extract_figures_strictly(doc, dpi_scale=dpi_val)
+    
+    if not results:
+        st.error("未提取到图片。请确认PDF是文字版（可选中文字），而非扫描版。")
     else:
-        prs.slide_width = Inches(13.33); prs.slide_height = Inches(7.5)
+        st.success(f"成功提取 {len(results)} 张图表！")
         
-    results = []
-    status = st.empty()
-    bar = st.progress(0)
-    
-    for i, page in enumerate(doc):
-        status.text(f"正在切片: 第 {i+1} 页...")
-        bar.progress((i+1)/len(doc))
-        
-        # 获取所有文本块
-        blocks = page.get_text("blocks")
-        
-        for b in blocks:
-            text = b[4].replace('\n', ' ').strip()
+        # 2. 生成 PPT
+        prs = Presentation()
+        # 设置版式
+        if ppt_ver.startswith("3:4"):
+            prs.slide_width = Inches(7.5) # A4 宽
+            prs.slide_height = Inches(10) # A4 高
+        else:
+            prs.slide_width = Inches(13.33)
+            prs.slide_height = Inches(7.5)
             
-            # 1. 发现图注
-            if is_caption(text):
-                # 2. 计算缝隙区域
-                crop_rect = get_gap_crop(page, b, blocks, page.rect.width)
-                
-                # 如果缝隙太小（小于10px），说明没有图，跳过
-                if crop_rect.height < 10:
-                    continue
-                
-                # 3. 高清渲染这个区域
-                pix = page.get_pixmap(matrix=fitz.Matrix(dpi, dpi), clip=crop_rect, alpha=False)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                
-                # 4. 关键步骤：自动裁剪白边
-                # 因为我们要了整个分栏的宽，左右肯定有很多白边，这里切掉
-                try:
-                    img_trimmed = trim(img)
-                except:
-                    img_trimmed = img
-                    
-                if img_trimmed is None or img_trimmed.height < 20:
-                    continue
-                
-                # 转换数据
-                img_byte_arr = io.BytesIO()
-                img_trimmed.save(img_byte_arr, format='PNG')
-                final_bytes = img_byte_arr.getvalue()
-                
-                results.append({
-                    "bytes": final_bytes,
-                    "name": sanitize_filename(text),
-                    "caption": text,
-                    "page": i+1
-                })
-                
-                # --- 写入 PPT ---
-                slide = prs.slides.add_slide(prs.slide_layouts[6])
-                ppt_w, ppt_h = prs.slide_width, prs.slide_height
-                
-                # 布局
-                margin = Inches(0.5)
-                max_w = ppt_w - 2 * margin
-                max_h = ppt_h - Inches(2.0)
-                
-                w, h = img_trimmed.size
-                ratio = w / h
-                
-                target_w = max_w
-                target_h = target_w / ratio
-                if target_h > max_h:
-                    target_h = max_h
-                    target_w = target_h * ratio
-                    
-                left = (ppt_w - target_w) / 2
-                top = Inches(0.5)
-                
-                slide.shapes.add_picture(io.BytesIO(final_bytes), left, top, width=target_w, height=target_h)
-                
-                # 文本框
-                tb = slide.shapes.add_textbox(margin, top + target_h + Inches(0.2), max_w, Inches(1.5))
-                p = tb.text_frame.add_paragraph()
-                p.text = text
-                p.alignment = PP_ALIGN.CENTER
-                p.font.size = Pt(14)
-                p.font.bold = True
-                p.font.name = "Microsoft YaHei"
-
-    status.success(f"完成！共提取 {len(results)} 张图。")
-    
-    if results:
+        for item in results:
+            slide = prs.slides.add_slide(prs.slide_layouts[6]) # 空白页
+            
+            # PPT 尺寸
+            pw = prs.slide_width
+            ph = prs.slide_height
+            margin = Inches(0.5)
+            
+            # 布局计算：图片区域预留 80% 高度，底部留给图注
+            max_img_h = ph - Inches(2.0)
+            max_img_w = pw - margin * 2
+            
+            # 原始比例
+            ratio = item["width"] / item["height"]
+            
+            # 目标尺寸
+            final_w = max_img_w
+            final_h = final_w / ratio
+            
+            if final_h > max_img_h:
+                final_h = max_img_h
+                final_w = final_h * ratio
+            
+            # 居中放置
+            left = (pw - final_w) / 2
+            top = Inches(0.5)
+            
+            # 插入图片
+            slide.shapes.add_picture(io.BytesIO(item["image_bytes"]), left, top, width=final_w, height=final_h)
+            
+            # 插入图注
+            tb = slide.shapes.add_textbox(margin, top + final_h + Inches(0.2), pw - margin*2, Inches(1.5))
+            tf = tb.text_frame
+            p = tf.add_paragraph()
+            p.text = item["caption"]
+            p.alignment = PP_ALIGN.CENTER
+            p.font.bold = True
+            p.font.size = Pt(14)
+            p.font.name = "Microsoft YaHei"
+        
+        # 3. 下载按钮
         col1, col2 = st.columns(2)
         
-        ppt_out = io.BytesIO()
-        prs.save(ppt_out); ppt_out.seek(0)
-        col1.download_button("📥 下载 PPT", ppt_out, "extracted.pptx")
+        # PPT
+        ppt_io = io.BytesIO()
+        prs.save(ppt_io)
+        ppt_io.seek(0)
+        col1.download_button("📥 下载 PPT", ppt_io, "figures_export.pptx")
         
-        zip_out = io.BytesIO()
-        with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as zf:
+        # ZIP
+        zip_io = io.BytesIO()
+        with zipfile.ZipFile(zip_io, "w", zipfile.ZIP_DEFLATED) as zf:
             for item in results:
-                zf.writestr(f"P{item['page']}_{item['name']}.png", item['bytes'])
-        zip_out.seek(0)
-        col2.download_button("📦 下载图片包 (ZIP)", zip_out, "images.zip")
+                fname = f"P{item['page']}_{item['name']}.png"
+                zf.writestr(fname, item['image_bytes'])
+        zip_io.seek(0)
+        col2.download_button("📦 下载图片包 (ZIP)", zip_io, "figures_images.zip")
         
         st.divider()
-        st.write("### 结果预览")
+        st.write("### 提取结果核对")
         for res in results:
-            st.image(res["bytes"], caption=res["caption"])
+            st.image(res["image_bytes"], caption=res["caption"])
