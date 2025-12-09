@@ -1,19 +1,38 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import streamlit.elements.image as st_image
 from PIL import Image, ImageChops, ImageDraw
 import io
 import re
 import zipfile
+import base64
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
 from streamlit_drawable_canvas import st_canvas
-import base64
 
-# --- 页面基础设置 ---
-st.set_page_config(page_title="PDF 图表手动提取工具", layout="wide", page_icon="✂️")
+# ==========================================
+# 🔥 紧急修复补丁 (Monkey Patch) 🔥
+# 修复 Streamlit 新版本导致 st_canvas 报错的问题
+# ==========================================
+if not hasattr(st_image, 'image_to_url'):
+    def local_image_to_url(image, width, clamp, channels, output_format, image_id):
+        """将 PIL 图片转为 Base64 DataURL，模拟旧版 Streamlit 行为"""
+        buffered = io.BytesIO()
+        # 强制转为 RGB 防止 RGBA 在 JPEG 下报错
+        if output_format.upper() == "JPEG" and image.mode == "RGBA":
+            image = image.convert("RGB")
+        image.save(buffered, format=output_format)
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return (f"data:image/{output_format.lower()};base64,{img_str}",)
+    
+    # 强行把这个函数塞回 Streamlit 里
+    st_image.image_to_url = local_image_to_url
+# ==========================================
 
-# --- 核心处理函数 ---
+# --- 页面配置 ---
+st.set_page_config(page_title="PDF 图表手动提取工具 (修复版)", layout="wide", page_icon="✂️")
+
+# --- 核心函数 ---
 def sanitize_filename(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return re.sub(r'[\\/*?:"<>|]', "_", text)[:50]
@@ -70,11 +89,12 @@ def process_selection(page, rect_pdf, dpi_scale=8.33):
     
     return out_io.getvalue(), full_caption, final_img.width, final_img.height
 
-# --- 状态管理 ---
+import fitz # PyMuPDF
+
+# --- UI 逻辑 ---
 if 'extracted_list' not in st.session_state:
     st.session_state.extracted_list = []
 
-# --- UI ---
 with st.sidebar:
     st.header("1. 上传文件")
     uploaded_file = st.file_uploader("PDF 文件", type="pdf")
@@ -88,7 +108,7 @@ with st.sidebar:
         st.session_state.extracted_list = []
         st.rerun()
 
-st.title("✂️ 框选提取工具")
+st.title("✂️ 框选提取工具 (已修复错误)")
 st.caption("步骤：上传 PDF → 选择页码 → **框选包含图和文字的区域** → 点击提取。")
 
 if uploaded_file:
@@ -100,20 +120,20 @@ if uploaded_file:
     
     # 准备页面图像
     page = doc[page_num - 1]
-    # 使用 2.0 倍缩放显示，保证画框时能看清字
+    
+    # 2倍缩放显示
     display_zoom = 2.0
     disp_pix = page.get_pixmap(matrix=fitz.Matrix(display_zoom, display_zoom))
     bg_img = Image.open(io.BytesIO(disp_pix.tobytes("png")))
     
-    st.write("👇 **在下方画框 (务必把图和下面的图注文字都框进去)**")
+    st.write("👇 **在下方画框 (包含图和文字)**")
     
     # 画布
-    # 注意：这里如果streamlit版本不对，会报错。请确保 requirements.txt 使用 streamlit==1.38.0
     canvas_result = st_canvas(
         fill_color="rgba(255, 0, 0, 0.1)",
         stroke_width=2,
         stroke_color="#FF0000",
-        background_image=bg_img, # 关键点：需要 Streamlit <= 1.38.0
+        background_image=bg_img, # 这里之前报错，现在补丁已修复
         update_streamlit=True,
         height=bg_img.height,
         width=bg_img.width,
@@ -127,7 +147,6 @@ if uploaded_file:
         if objects:
             last_obj = objects[-1]
             if st.button("⚡ 提取选中区域", type="primary"):
-                # 坐标换算 Canvas -> PDF
                 scale = 1 / display_zoom
                 r_x = last_obj["left"] * scale
                 r_y = last_obj["top"] * scale
@@ -145,9 +164,9 @@ if uploaded_file:
                         "page": page_num,
                         "w": w, "h": h
                     })
-                    st.success(f"成功提取: {img_name}")
+                    st.success(f"提取成功: {img_name}")
                 except Exception as e:
-                    st.error(f"提取失败，请重试: {e}")
+                    st.error(f"提取出错: {e}")
 
     # --- 导出 ---
     if st.session_state.extracted_list:
@@ -159,49 +178,4 @@ if uploaded_file:
         # PPT
         prs = Presentation()
         if ppt_ratio.startswith("3:4"):
-            prs.slide_width = Inches(7.5); prs.slide_height = Inches(10)
-        else:
-            prs.slide_width = Inches(13.33); prs.slide_height = Inches(7.5)
-            
-        for item in st.session_state.extracted_list:
-            slide = prs.slides.add_slide(prs.slide_layouts[6])
-            pw, ph = prs.slide_width, prs.slide_height
-            margin = Inches(0.5)
-            
-            # 图片布局
-            max_h = ph - Inches(1.5)
-            max_w = pw - margin * 2
-            ratio = item["w"] / item["h"]
-            target_w = max_w
-            target_h = target_w / ratio
-            if target_h > max_h:
-                target_h = max_h
-                target_w = target_h * ratio
-                
-            left = (pw - target_w) / 2
-            top = Inches(0.5)
-            
-            slide.shapes.add_picture(io.BytesIO(item["bytes"]), left, top, width=target_w, height=target_h)
-            
-            tb = slide.shapes.add_textbox(margin, top + target_h + Inches(0.1), pw - margin*2, Inches(1))
-            p = tb.text_frame.add_paragraph()
-            p.text = item["name"]
-            p.alignment = PP_ALIGN.CENTER
-            p.font.bold = True
-            p.font.size = Pt(14)
-            p.font.name = "Microsoft YaHei"
-            
-        ppt_out = io.BytesIO()
-        prs.save(ppt_out); ppt_out.seek(0)
-        c1.download_button("📥 下载 PPTX", ppt_out, "extracted_slides.pptx")
-        
-        # ZIP
-        zip_out = io.BytesIO()
-        with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, item in enumerate(st.session_state.extracted_list):
-                zf.writestr(f"P{item['page']}_{i+1}_{item['name']}.png", item["bytes"])
-        zip_out.seek(0)
-        c2.download_button("📦 下载图片包", zip_out, "extracted_images.zip")
-
-else:
-    st.info("请上传 PDF 开始")
+            pr
