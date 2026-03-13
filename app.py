@@ -12,6 +12,11 @@ from pptx.enum.text import PP_ALIGN
 from streamlit_drawable_canvas import st_canvas
 
 # ==========================================
+# 0. 页面配置 (必须是第一个 st 命令)
+# ==========================================
+st.set_page_config(page_title="PDF 瀑布流提取工具", layout="wide", page_icon="📜")
+
+# ==========================================
 # 1. 紧急修复补丁 (防止报错)
 # ==========================================
 if not hasattr(st_image, 'image_to_url'):
@@ -27,8 +32,6 @@ if not hasattr(st_image, 'image_to_url'):
 # ==========================================
 # 2. 核心功能函数
 # ==========================================
-st.set_page_config(page_title="PDF 瀑布流提取工具", layout="wide", page_icon="📜")
-
 def sanitize_filename(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return re.sub(r'[\\/*?:"<>|]', "_", text)[:50]
@@ -50,6 +53,7 @@ def get_page_image(file_content, page_num, zoom=2.0):
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
+    doc.close()
     return img
 
 def process_extraction(file_content, page_num, rect_dict, dpi_scale=8.33):
@@ -104,6 +108,7 @@ def process_extraction(file_content, page_num, rect_dict, dpi_scale=8.33):
     
     out_io = io.BytesIO()
     final_img.save(out_io, format="PNG")
+    doc.close()
     
     return out_io.getvalue(), full_caption, final_img.width, final_img.height
 
@@ -115,22 +120,34 @@ def process_extraction(file_content, page_num, rect_dict, dpi_scale=8.33):
 if 'extracted_list' not in st.session_state:
     st.session_state.extracted_list = []
 
+# 小红书笔记链接
+XHS_LINK = "https://www.xiaohongshu.com/explore/696f27e7000000000a03ee45?xsec_token=ABft3QO37w_LDTt8J5zePSaog2TSYY1qVxGckdEZeuUpc=&xsec_source=pc_user"
+
+# 统一读取文件内容，优化内存，避免重复 read()
+bytes_data = None
+total_pages = 0
+
 # --- 侧边栏 ---
 with st.sidebar:
     st.header("1. 导入 PDF")
     uploaded_file = st.file_uploader("文件上传", type="pdf")
     
-    # 如果文件太大，允许用户限制显示的页数，避免卡顿
     display_range = None
     if uploaded_file:
-        doc_temp = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+        bytes_data = uploaded_file.getvalue()
+        doc_temp = fitz.open(stream=bytes_data, filetype="pdf")
         total_pages = len(doc_temp)
+        doc_temp.close() # 及时释放内存
+        
+        # 侧边栏小红书提醒
+        st.markdown(f"🌟 **支持作者**：[去小红书留言口令]({XHS_LINK})")
+        
         if total_pages > 5:
             st.info(f"文档共 {total_pages} 页")
             display_range = st.slider("显示页码范围 (防止卡顿)", 1, total_pages, (1, min(10, total_pages)))
     
     st.divider()
-    st.header("3. 导出结果")
+    st.header("2. 导出结果")
     st.write(f"已提取图片: **{len(st.session_state.extracted_list)}** 张")
     
     # 预览小图
@@ -151,7 +168,6 @@ with st.sidebar:
         
         # PPTX
         prs = Presentation()
-        # 默认 3:4
         prs.slide_width = Inches(7.5); prs.slide_height = Inches(10)
         
         for item in st.session_state.extracted_list:
@@ -200,9 +216,14 @@ with st.sidebar:
 st.title("📜 浏览模式提取工具")
 st.info("操作方式：像看书一样往下滑，看到想提取的图，直接**画框**，然后点下方的**⚡提取**按钮。")
 
-if uploaded_file:
-    # 读取文件流
-    bytes_data = uploaded_file.getvalue()
+if uploaded_file and bytes_data:
+    # 强制留言提醒区块
+    st.success("🎉 **文件读取成功！**")
+    st.warning(f"""
+    **📢 温馨提示：**  
+    如果您觉得这个工具好用，**请务必前往原笔记评论区留言口令**，您的支持是我更新的最大动力！❤️  
+    👉 [点击这里一键跳转至小红书原笔记留言]({XHS_LINK})
+    """)
     
     # 确定显示范围
     start_p = 0
@@ -230,18 +251,16 @@ if uploaded_file:
             height=bg_image.height,
             width=bg_image.width,
             drawing_mode="rect",
-            key=f"canvas_page_{p_idx}", # 关键：每页独立的 ID
+            key=f"canvas_page_{p_idx}", 
             display_toolbar=True,
         )
         
         # 3. 提取按钮 (跟随在每一页下面)
-        # 检查当前页是否有新画的框
         if canvas_result.json_data and canvas_result.json_data["objects"]:
             last_obj = canvas_result.json_data["objects"][-1]
             
             col_btn, col_msg = st.columns([1, 4])
             with col_btn:
-                # 按钮 key 也必须唯一
                 if st.button(f"⚡ 提取第 {p_idx+1} 页选中区域", key=f"btn_{p_idx}", type="primary"):
                     try:
                         img_bytes, img_name, w, h = process_extraction(bytes_data, p_idx, last_obj)
@@ -252,7 +271,7 @@ if uploaded_file:
                             "page": p_idx + 1,
                             "w": w, "h": h
                         })
-                        st.success(f"已提取: {img_name}")
+                        st.toast(f"✅ 已成功提取: {img_name}")
                         # 强制刷新侧边栏
                         st.rerun()
                     except Exception as e:
@@ -261,4 +280,4 @@ if uploaded_file:
                 st.caption("✅ 已选中区域，点击左侧按钮提取")
 
 else:
-    st.warning("请在左侧上传 PDF 文件。")
+    st.warning("👈 请在左侧上传 PDF 文件即可开始。")
